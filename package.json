@@ -1,0 +1,48 @@
+{
+  "name": "cinny-electron",
+  "productName": "iCinny",
+  "version": "4.12.7",
+  "description": "iCinny: the Cinny Matrix client in an Electron/Chromium shell for macOS",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "sync-web": "rm -rf web && cp -R ../cinny-web/dist web && node scripts/patch-config.js",
+    "start": "electron .",
+    "selftest": "CINNY_SELFTEST=1 electron .",
+    "dist": "npm run sync-web && electron-builder --mac --arm64 --dir",
+    "release": "scripts/release.sh"
+  },
+  "build": {
+    "appId": "app.icinny.mac",
+    "productName": "iCinny",
+    "files": [
+      "main.js",
+      "preload.js",
+      "updater.js",
+      "build-info.json",
+      "update-pubkey.pem",
+      "web/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.social-networking",
+      "target": "dir",
+      "icon": "build/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "identity": null,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "iCinny needs the microphone for voice and video calls.",
+        "NSCameraUsageDescription": "iCinny needs the camera for video calls."
+      }
+    },
+    "directories": {
+      "output": "release"
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  }
+}
