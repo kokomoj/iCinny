@@ -10,6 +10,17 @@ A macOS app for [Matrix](https://matrix.org) chat: the [Cinny](https://github.co
 
 The app is signed with a Developer ID and notarized by Apple. It checks for updates shortly after launch and every 4 hours, and installs them when you choose **Restart Now** (or the next time you quit). You can also use **iCinny → Check for Updates…**.
 
+## Profiles
+
+iCinny can run several copies side by side, each signed into a different account or homeserver and told apart by its Dock icon colour. Use the **Profiles** menu to:
+
+- **New Profile…** — pick a name, an icon colour, and whether it opens automatically when iCinny starts. It launches as its own window right away.
+- Switch to another profile — click its name in the menu; it opens (or comes to the front) as a separate copy.
+- **Edit This Profile…** — rename it or change its colour (the Dock icon updates immediately).
+- **Delete Profile…** — remove a profile and sign that account out on this Mac.
+
+The original "iCinny" is the default profile and keeps its existing login. Named profiles store their data separately. Updates are handled by the default profile and apply to all of them together.
+
 ## How updates are protected
 
 Each release publishes a `latest.json` feed. An update is only installed if:

@@ -117,6 +117,7 @@ git -C "$WEB" checkout -q -f "$LATEST_TAG"
 git -C "$WEB" clean -qfd -e node_modules
 node scripts/patch-cinny-badge.js "$WEB"
 node scripts/patch-cinny-notify.js "$WEB"
+node scripts/patch-cinny-oauth.js "$WEB"
 (cd "$WEB" && npm ci --no-audit --no-fund --loglevel=error >/dev/null && npm run build >/dev/null 2>&1) || fail "cinny web build"
 git -C "$WEB" checkout -q -f -- .   # leave the source tree clean
 

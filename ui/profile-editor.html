@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self';" />
+<title>Profile</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 22px 24px;
+    font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #1f1f22; color: #e8e8ea; user-select: none;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0 0 16px; }
+  label { display: block; font-size: 12px; color: #a8a8ad; margin: 0 0 6px; }
+  input[type=text] {
+    width: 100%; padding: 8px 10px; margin: 0 0 18px;
+    background: #2a2a2e; border: 1px solid #3a3a40; border-radius: 7px;
+    color: #fff; font-size: 14px; outline: none;
+  }
+  input[type=text]:focus { border-color: #4FA8FF; }
+  .swatches { display: flex; gap: 12px; margin: 0 0 18px; flex-wrap: wrap; }
+  .swatch {
+    width: 38px; height: 38px; border-radius: 10px; cursor: pointer;
+    border: 3px solid transparent; transition: border-color .1s;
+  }
+  .swatch[aria-selected="true"] { border-color: #fff; }
+  .sw-blue { background: linear-gradient(#4FA8FF,#1F4FE0); }
+  .sw-red { background: linear-gradient(#FF7A6B,#E01F3C); }
+  .sw-green { background: linear-gradient(#5BE08A,#1FA85A); }
+  .sw-purple { background: linear-gradient(#B57BFF,#6E24C8); }
+  .sw-orange { background: linear-gradient(#FFB24F,#F07A1F); }
+  .sw-graphite { background: linear-gradient(#8A92A0,#3A4150); }
+  .row { display: flex; align-items: center; gap: 9px; margin: 0 0 22px; }
+  .row input { width: 16px; height: 16px; }
+  .row label { margin: 0; color: #e8e8ea; font-size: 13px; }
+  .actions { display: flex; justify-content: flex-end; gap: 10px; }
+  button {
+    padding: 8px 18px; border-radius: 7px; border: none; cursor: pointer;
+    font-size: 13px; font-weight: 500;
+  }
+  .primary { background: #2f6bff; color: #fff; }
+  .primary:disabled { opacity: .5; cursor: default; }
+  .secondary { background: #3a3a40; color: #e8e8ea; }
+  .err { color: #ff6b6b; font-size: 12px; min-height: 16px; margin: -12px 0 10px; }
+</style>
+</head>
+<body>
+  <h1 id="heading">New Profile</h1>
+
+  <label for="name">Profile name</label>
+  <input id="name" type="text" maxlength="60" autocomplete="off" spellcheck="false" placeholder="e.g. Work" />
+
+  <label>Dock icon colour</label>
+  <div class="swatches" id="swatches" role="listbox" aria-label="Icon colour"></div>
+
+  <div class="row">
+    <input id="openAtLaunch" type="checkbox" />
+    <label for="openAtLaunch">Open automatically when iCinny starts</label>
+  </div>
+
+  <div class="err" id="err"></div>
+
+  <div class="actions">
+    <button class="secondary" id="cancel" type="button">Cancel</button>
+    <button class="primary" id="save" type="button">Create</button>
+  </div>
+
+<script src="profile-editor.js"></script>
+</body>
+</html>

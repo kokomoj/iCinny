@@ -220,26 +220,83 @@ function promptRestart() {
     });
 }
 
+// --- Multi-instance coordination ------------------------------------------
+// When several iCinny profiles run at once they all execute from the SAME .app
+// bundle. Before swapping that bundle we must get every other instance to quit.
+// The default instance writes a "quit request" file; named instances watch it
+// and app.quit(). Then the swap helper waits (pgrep on the exact MacOS path)
+// until NO process runs from the bundle before replacing it.
+const PROFILES_DIRNAME = 'iCinny Profiles';
+function quitRequestPath(appData) {
+  return path.join(appData, PROFILES_DIRNAME, 'quit-request');
+}
+
+// Named profiles call this: quit when the default instance asks (file appears or
+// its mtime moves forward after we started). Uses a poll (robust) plus fs.watch.
+function watchQuitRequest(appData, onQuit) {
+  const file = quitRequestPath(appData);
+  const dir = path.dirname(file);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const startedAt = Date.now();
+  let fired = false;
+  const trigger = () => {
+    if (fired) return;
+    let mtime = 0;
+    try { mtime = fs.statSync(file).mtimeMs; } catch { return; }
+    // Only honour a request written AFTER we started (ignore a stale file).
+    if (mtime >= startedAt - 1000) { fired = true; try { onQuit(); } catch {} }
+  };
+  const timer = setInterval(trigger, 1000);
+  if (timer.unref) timer.unref();
+  try {
+    const w = fs.watch(dir, (_evt, name) => { if (name === 'quit-request') trigger(); });
+    if (w.unref) w.unref();
+  } catch {}
+}
+
+// Default instance: ask every other iCinny instance to quit (touch the file).
+function requestOtherInstancesQuit(appData) {
+  const file = quitRequestPath(appData);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, String(Date.now()));
+  } catch (e) {
+    log('could not write quit-request:', e.message);
+  }
+}
+
 // Called on before-quit: if an update is staged, hand off to the swap helper.
-function installOnQuit() {
+function installOnQuit(opts = {}) {
   if (!staged) return;
   const target = currentAppPath();
   if (!target.endsWith('.app')) return;
+  // Ask any other running profiles (same bundle) to quit before we swap.
+  if (opts.appData) requestOtherInstancesQuit(opts.appData);
   // Install under the new bundle's own name (Cinny.app → iCinny.app on the first renamed build).
   const dest = path.join(path.dirname(target), path.basename(staged.appPath));
-  // Paths go in as positional arguments ($1..$4), never spliced into the script
+  const macosDir = path.join(target, 'Contents', 'MacOS');
+  // Paths go in as positional arguments ($1..$5), never spliced into the script
   // text, so an unusual install path can't change what the shell runs.
+  //   $1 = our pid        $2 = target .app   $3 = dest .app
+  //   $4 = staged .app    $5 = target Contents/MacOS dir (for the "no process" wait)
+  // The swap waits up to ~30s for EVERY process running from $5 to exit (not just
+  // us); if any is still there it ABORTS, leaving the old app intact.
   const script = [
-    'while kill -0 "$1" 2>/dev/null; do sleep 0.3; done',
+    'while kill -0 "$1" 2>/dev/null; do sleep 0.3; done', // wait for us to exit
+    // Wait for all other instances running from this bundle to exit (max ~30s).
+    'n=0',
+    'while /usr/bin/pgrep -f "$5/" >/dev/null 2>&1; do',
+    '  n=$((n+1)); [ "$n" -ge 100 ] && exit 2; sleep 0.3;',
+    'done',
     'sleep 0.5',
     'rm -rf "$2.old"',
     '[ "$3" != "$2" ] && rm -rf "$3"',
     'mv "$2" "$2.old" && mv "$4" "$3" || { mv "$2.old" "$2"; exit 1; }',
     '/usr/bin/xattr -cr "$3" 2>/dev/null',
     'rm -rf "$2.old"',
-    UPDATE_TEST ? 'echo swapped > "$3.swapped"' : '/usr/bin/open "$3"',
+    opts.updateTestHook || UPDATE_TEST ? 'echo swapped > "$3.swapped"' : '/usr/bin/open "$3"',
   ].join('\n');
-  const child = spawn('/bin/bash', ['-c', script, 'icinny-swap', String(process.pid), target, dest, staged.appPath], {
+  const child = spawn('/bin/bash', ['-c', script, 'icinny-swap', String(process.pid), target, dest, staged.appPath, macosDir], {
     detached: true,
     stdio: 'ignore',
   });
@@ -248,10 +305,10 @@ function installOnQuit() {
   log('swap helper launched for', target);
 }
 
-function start(windowGetter) {
+function start(windowGetter, opts = {}) {
   getWindow = windowGetter;
   setTimeout(() => check(), UPDATE_TEST ? 2000 : 15 * 1000);
   setInterval(() => check(), CHECK_EVERY_MS);
 }
 
-module.exports = { start, check, installOnQuit, BUILD, gateStagedUpdate, parseTeamId, appTeamId, verifyStrict, TEAM_ID };
+module.exports = { start, check, installOnQuit, watchQuitRequest, requestOtherInstancesQuit, quitRequestPath, BUILD, gateStagedUpdate, parseTeamId, appTeamId, verifyStrict, TEAM_ID };

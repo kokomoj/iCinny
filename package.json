@@ -18,9 +18,15 @@
     "files": [
       "main.js",
       "preload.js",
+      "oauth.js",
+      "profile-bar.js",
+      "profiles.js",
+      "profile-preload.js",
       "updater.js",
       "build-info.json",
       "update-pubkey.pem",
+      "ui/**/*",
+      "build/profile-icons/*.png",
       "web/**/*"
     ],
     "mac": {

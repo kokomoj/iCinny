@@ -66,13 +66,37 @@ open("sheet.html","w").write(f'''<html><body style="margin:0;background:linear-g
 {"".join(f'<img src="{k}.svg" width="96">' for k in icons)}</div>
 <style>.c{{text-align:center}}.row{{display:flex;align-items:center;justify-content:center;gap:24px}}p{{margin:6px}}</style></body></html>''')
 
-# B2 — Bubble Blue
+# B2 — Bubble, in a palette of profile colours.
+# Each colour: tile gradient (top→bottom), the inner bird-disc gradient
+# (start→end), and the bubble drop-shadow flood colour. "blue" is the ORIGINAL
+# B2 icon and its SVG output is byte-for-byte what it always was (the bundle
+# icon stays blue). The others are new per-profile Dock icons.
 bubble = '<path d="M512 230c-170 0-300 112-300 262 0 82 40 155 104 203-6 44-30 86-66 112 72 6 140-20 186-62 24 6 50 9 76 9 170 0 300-112 300-262S682 230 512 230z" fill="#fff"/>'
-blue = wrap(
-  '<linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4FA8FF"/><stop offset="1" stop-color="#1F4FE0"/></linearGradient>'
-  '<linearGradient id="hl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".25"/><stop offset=".5" stop-color="#fff" stop-opacity="0"/></linearGradient>'
-  '<linearGradient id="d" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3D8BFF"/><stop offset="1" stop-color="#1F4FE0"/></linearGradient>'
-  '<filter id="bs"><feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#0b1f6b" flood-opacity=".35"/></filter>',
-  f'<g filter="url(#sh)">{TILE} fill="url(#g)"/></g>{TILE} fill="url(#hl)"/>'
-  f'<g filter="url(#bs)">{bubble}</g>' + emblem(512, 492, 400, "url(#d)", "#FFFFFF"))
-open("B2-bubble-blue.svg","w").write(blue)
+
+PALETTE = {
+    # name:    (tileTop,   tileBottom, discStart, discEnd,  bubbleShadowFlood)
+    "blue":     ("#4FA8FF", "#1F4FE0", "#3D8BFF", "#1F4FE0", "#0b1f6b"),
+    "red":      ("#FF7A6B", "#E01F3C", "#FF5A4D", "#C8102E", "#6b0b17"),
+    "green":    ("#5BE08A", "#1FA85A", "#43D37A", "#128C44", "#0b3b1f"),
+    "purple":   ("#B57BFF", "#6E24C8", "#A05CF0", "#5A1FB0", "#2e0b5b"),
+    "orange":   ("#FFB24F", "#F07A1F", "#FF9E3D", "#E0631F", "#6b3b0b"),
+    "graphite": ("#8A92A0", "#3A4150", "#6B7483", "#2C323E", "#141820"),
+}
+
+def b2(tile_top, tile_bottom, disc_start, disc_end, bubble_flood):
+    return wrap(
+      f'<linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{tile_top}"/><stop offset="1" stop-color="{tile_bottom}"/></linearGradient>'
+      '<linearGradient id="hl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".25"/><stop offset=".5" stop-color="#fff" stop-opacity="0"/></linearGradient>'
+      f'<linearGradient id="d" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{disc_start}"/><stop offset="1" stop-color="{disc_end}"/></linearGradient>'
+      f'<filter id="bs"><feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="{bubble_flood}" flood-opacity=".35"/></filter>',
+      f'<g filter="url(#sh)">{TILE} fill="url(#g)"/></g>{TILE} fill="url(#hl)"/>'
+      f'<g filter="url(#bs)">{bubble}</g>' + emblem(512, 492, 400, "url(#d)", "#FFFFFF"))
+
+# Keep the canonical blue file name for back-compat, plus profile-icons/<name>.svg
+blue = b2(*PALETTE["blue"])
+open("B2-bubble-blue.svg", "w").write(blue)
+
+os.makedirs("profile-icons", exist_ok=True)
+for name, spec in PALETTE.items():
+    open(f"profile-icons/{name}.svg", "w").write(b2(*spec))
+print("wrote B2-bubble-blue.svg and profile-icons/{%s}.svg" % ",".join(PALETTE))
