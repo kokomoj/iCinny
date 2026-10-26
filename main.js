@@ -139,6 +139,52 @@ function applyDockIcon() {
   if (img) app.dock.setIcon(img);
 }
 
+// Coloured dot per profile colour, used in notification titles.
+const COLOR_DOT = { blue: '🔵', red: '🔴', green: '🟢', purple: '🟣', orange: '🟠', graphite: '⚫' };
+
+// Tag notifications only once there's more than one profile (a lone default
+// profile keeps plain notifications).
+function notificationTag() {
+  let multi = !IS_DEFAULT;
+  try {
+    multi = multi || P.readRegistry(APP_DATA).some((p) => p.slug !== PROFILE_SLUG);
+  } catch {}
+  if (!multi) return null;
+  const color = (PROFILE && PROFILE.color) || P.DEFAULT_COLOR;
+  const img = iconForColor(color);
+  return {
+    prefix: `${COLOR_DOT[color] || COLOR_DOT.blue} ${profileName()} · `,
+    icon: img ? img.resize({ width: 128, height: 128 }).toDataURL() : null,
+  };
+}
+
+// Install (once) the window.Notification wrapper and (re)set its tag, so a
+// profile rename/recolour applies to the next notification straight away.
+function applyNotificationTag() {
+  if (!win || win.isDestroyed()) return;
+  const tag = notificationTag();
+  const js = `(() => {
+    window.__icinnyNotifyTag = ${JSON.stringify(tag)};
+    if (window.__icinnyNotifyWrapped) return;
+    const Native = window.Notification;
+    if (!Native) return;
+    function Wrapped(title, options) {
+      const tag = window.__icinnyNotifyTag;
+      if (!tag) return new Native(title, options);
+      const t = typeof title === 'string' && title.indexOf(tag.prefix) !== 0 ? tag.prefix + title : title;
+      const o = Object.assign({}, options || {});
+      if (tag.icon) o.icon = tag.icon;
+      return new Native(t, o);
+    }
+    Wrapped.prototype = Native.prototype;
+    Object.defineProperty(Wrapped, 'permission', { get() { return Native.permission; } });
+    Wrapped.requestPermission = (...a) => Native.requestPermission(...a);
+    try { window.Notification = Wrapped; } catch (e) {}
+    window.__icinnyNotifyWrapped = true;
+  })();`;
+  win.webContents.executeJavaScript(js, true).catch(() => {});
+}
+
 // Draw/update the header bar in the profile's colour with its name.
 function applyProfileBar() {
   if (!win || win.isDestroyed()) return;
@@ -177,31 +223,12 @@ function createWindow() {
     win.setTitle(IS_DEFAULT ? rewritten : `${APP_NAME} — ${profileName()}`);
   });
 
-  // For NAMED profiles, prefix web notification titles with "[<Name>] " so the
-  // user can tell which account a notification is from. Done by wrapping
-  // window.Notification in the page's main world — contextIsolation + sandbox
-  // stay ON (executeJavaScript runs in the page world without a preload bridge).
-  if (!IS_DEFAULT) {
-    const prefix = `[${profileName()}] `;
-    win.webContents.on('dom-ready', () => {
-      const js = `(() => {
-        if (window.__icinnyNotifyWrapped) return;
-        const Native = window.Notification;
-        if (!Native) return;
-        const PREFIX = ${JSON.stringify(prefix)};
-        function Wrapped(title, options) {
-          const t = (typeof title === 'string' && title.indexOf(PREFIX) !== 0) ? PREFIX + title : title;
-          return new Native(t, options);
-        }
-        Wrapped.prototype = Native.prototype;
-        Object.defineProperty(Wrapped, 'permission', { get() { return Native.permission; } });
-        Wrapped.requestPermission = (...a) => Native.requestPermission(...a);
-        try { window.Notification = Wrapped; } catch (e) {}
-        window.__icinnyNotifyWrapped = true;
-      })();`;
-      win.webContents.executeJavaScript(js, true).catch(() => {});
-    });
-  }
+  // Notifications say which profile sent them: a coloured dot + the profile
+  // name in front of the title, and the profile's coloured iCinny icon as the
+  // notification picture. (macOS always draws the app's own blue icon on the
+  // left; that can't change per profile.) Wraps window.Notification in the
+  // page's main world; contextIsolation + sandbox stay ON.
+  win.webContents.on('dom-ready', applyNotificationTag);
 
   // Profile-coloured header bar (all profiles, so every copy is tinted).
   win.webContents.on('dom-ready', applyProfileBar);
@@ -387,6 +414,7 @@ function setupProfileIpc() {
       // Apply live: dock icon + window title.
       applyDockIcon();
       applyProfileBar();
+      applyNotificationTag();
       if (win) win.setTitle(windowBaseTitle());
       app.setAboutPanelOptions({
         applicationName: APP_NAME,

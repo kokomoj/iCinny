@@ -52,7 +52,11 @@ function verifyFeed(feed) {
 
 async function fetchJSON(url) {
   const res = await net.fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`feed HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
@@ -188,7 +192,22 @@ async function check({ manual = false } = {}) {
     promptRestart();
   } catch (e) {
     log('check failed:', e.message);
-    if (manual) dialog.showMessageBox({ type: 'warning', message: 'Update check failed', detail: e.message });
+    if (manual) {
+      // Plain-language messages; the technical reason stays in the log.
+      if (e.status === 404) {
+        // No published release on the feed yet (only pre-releases exist).
+        dialog.showMessageBox({
+          message: 'No updates available',
+          detail: `You have iCinny ${BUILD.version} (build ${BUILD.build}). There's no newer release yet.`,
+        });
+      } else {
+        dialog.showMessageBox({
+          type: 'warning',
+          message: "Couldn't check for updates",
+          detail: 'Check your internet connection and try again later.',
+        });
+      }
+    }
   } finally {
     checking = false;
   }
