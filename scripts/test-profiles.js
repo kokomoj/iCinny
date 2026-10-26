@@ -192,3 +192,52 @@ test('findProfile: finds by slug, defaults when absent', () => {
   assert.strictEqual(P.findProfile(reg, 'missing'), null);
   assert.strictEqual(P.findProfile(reg).slug, 'default'); // no slug → default
 });
+
+// --- one-app model: session partition per profile -------------------------
+
+test('partitionFor: default profile uses the default session (null)', () => {
+  assert.strictEqual(P.partitionFor('default'), null);
+  assert.strictEqual(P.partitionFor(''), null);
+  assert.strictEqual(P.partitionFor(null), null);
+  assert.strictEqual(P.partitionFor(undefined), null);
+});
+
+test('partitionFor: named profile → persisted partition keyed by slug', () => {
+  assert.strictEqual(P.partitionFor('work'), 'persist:profile-work');
+  assert.strictEqual(P.partitionFor('home-2'), 'persist:profile-home-2');
+});
+
+// --- one-app model: which profile windows were open on quit ----------------
+
+test('openSlugsPath points inside "iCinny Profiles"', () => {
+  assert.strictEqual(
+    P.openSlugsPath('/AppData'),
+    path.join('/AppData', 'iCinny Profiles', 'open-windows.json')
+  );
+});
+
+test('readOpenSlugs / writeOpenSlugs: round-trips a sanitised slug list', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'icinny-open-'));
+  // missing file → empty
+  assert.deepStrictEqual(P.readOpenSlugs(dir), []);
+  P.writeOpenSlugs(dir, ['default', 'work', 'home']);
+  assert.deepStrictEqual(P.readOpenSlugs(dir), ['default', 'work', 'home']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('writeOpenSlugs: drops junk/dupes, keeps default + valid slugs, never throws', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'icinny-open-'));
+  P.writeOpenSlugs(dir, ['default', 'work', 'work', 'BAD SLUG', 42, null, 'home']);
+  assert.deepStrictEqual(P.readOpenSlugs(dir), ['default', 'work', 'home']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('readOpenSlugs: corrupt file → empty list, never throws', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'icinny-open-'));
+  fs.mkdirSync(P.profilesDir(dir), { recursive: true });
+  fs.writeFileSync(P.openSlugsPath(dir), 'not json ]');
+  assert.deepStrictEqual(P.readOpenSlugs(dir), []);
+  fs.writeFileSync(P.openSlugsPath(dir), '{"nope":1}');
+  assert.deepStrictEqual(P.readOpenSlugs(dir), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

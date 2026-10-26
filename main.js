@@ -2,11 +2,16 @@
 // Serves the bundled Cinny web build from a privileged custom scheme (cinny://app)
 // so it gets a secure context + a working service worker (Cinny's SW injects the
 // access token into authenticated media requests; without it images/files break).
+//
+// Profiles: ONE process, one Dock icon, a window per profile (like Chrome
+// windows). The DEFAULT profile uses session.defaultSession (today's userData,
+// so its login is untouched); every NAMED profile uses its own persisted
+// session partition so its storage is isolated. The coloured header bar and the
+// notification tag — applied per window — are how profiles are told apart.
 const { app, BrowserWindow, protocol, net, shell, session, Menu, dialog, ipcMain, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
-const { spawn } = require('child_process');
 const updater = require('./updater');
 const P = require('./profiles');
 const oauth = require('./oauth');
@@ -22,41 +27,53 @@ const PROFILE_ICON_DIR = path.join(__dirname, 'build', 'profile-icons');
 
 app.setName(APP_NAME);
 
-// --- Profile resolution ----------------------------------------------------
-// A profile is picked by the --profile=<slug> launch argument (no flag = the
-// default profile, which keeps using today's data folder so the existing login
-// is untouched). userData MUST be set BEFORE requestSingleInstanceLock() because
-// the single-instance lock is keyed on the userData dir — that is what lets each
-// profile be its own single instance and lets different profiles run side by side.
-const PROFILE_SLUG = P.parseProfileArg(process.argv);
-const IS_DEFAULT = PROFILE_SLUG === P.DEFAULT_SLUG;
+// --- userData (default profile) --------------------------------------------
+// There is only one process. userData is the DEFAULT profile's store: the
+// legacy "<appData>/Cinny" folder if it exists (so the existing login survives
+// the iCinny rename), else electron's normal default dir. Named profiles live
+// in their own session partitions inside this same userData, isolated by
+// Chromium — no per-profile userData override.
 const APP_DATA = app.getPath('appData');
-const DEFAULT_USER_DATA = app.getPath('userData'); // electron's default before we override
+const DEFAULT_USER_DATA = app.getPath('userData'); // electron's default before override
 const LEGACY_DIR = path.join(APP_DATA, P.LEGACY_DIRNAME);
-
 app.setPath('userData', P.userDataDir({
-  slug: PROFILE_SLUG,
+  slug: P.DEFAULT_SLUG,
   appData: APP_DATA,
   defaultUserData: DEFAULT_USER_DATA,
   legacyExists: fs.existsSync(LEGACY_DIR),
 }));
+const BASE_USER_DATA = app.getPath('userData');
 
-// Look up this profile's name + colour from the registry (safe on a corrupt file).
-function currentProfile() {
-  const reg = P.readRegistry(APP_DATA);
-  return P.findProfile(reg, PROFILE_SLUG) || P.defaultProfile();
+function readRegistry() {
+  return P.readRegistry(APP_DATA);
 }
-let PROFILE = currentProfile();
-
-// The window/About/notification name. Default profile: its registry name if the
-// user set one, else "iCinny". Named profile: its name.
-function profileName() {
-  return PROFILE && PROFILE.name ? PROFILE.name : (IS_DEFAULT ? APP_NAME : PROFILE_SLUG);
+// The profile object for a slug (safe on a corrupt/missing registry).
+function profileFor(slug) {
+  return P.findProfile(readRegistry(), slug) || P.defaultProfile();
 }
-// Window base title: default → "iCinny"; named → "iCinny — <Name>".
-function windowBaseTitle() {
-  if (IS_DEFAULT) return APP_NAME;
-  return `${APP_NAME} — ${profileName()}`;
+function isDefaultSlug(slug) {
+  return !slug || slug === P.DEFAULT_SLUG;
+}
+// Display name for a profile. Default: its registry name if set, else "iCinny".
+function profileName(slug) {
+  const p = profileFor(slug);
+  if (p && p.name) return p.name;
+  return isDefaultSlug(slug) ? APP_NAME : slug;
+}
+// Is there more than one profile (default + at least one named)? Governs
+// whether the window title and notifications get a profile tag.
+function multiProfile() {
+  try {
+    return readRegistry().some((p) => p.slug !== P.DEFAULT_SLUG);
+  } catch {
+    return false;
+  }
+}
+// Window base title: a lone default profile → "iCinny"; otherwise
+// "iCinny — <Name>".
+function windowBaseTitle(slug) {
+  if (isDefaultSlug(slug) && !multiProfile()) return APP_NAME;
+  return `${APP_NAME} — ${profileName(slug)}`;
 }
 
 protocol.registerSchemesAsPrivileged([
@@ -80,8 +97,7 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
-// Single-instance lock is PER userData dir (set above), so launching the same
-// profile twice focuses the existing window while different profiles coexist.
+// One single-instance lock for the whole app (all profiles share the process).
 if (!SELFTEST && !app.requestSingleInstanceLock()) {
   app.quit();
 }
@@ -96,11 +112,19 @@ function resolveFile(urlPath) {
   return null;
 }
 
-function registerAppProtocol() {
-  protocol.handle(SCHEME, async (request) => {
+// --- Per-session setup -----------------------------------------------------
+// Everything that used to live on the default session is installed on EVERY
+// profile session here, so named profiles behave identically to the default
+// one (protocol, permissions, downloads).
+const configuredSessions = new WeakSet();
+function setupSession(ses) {
+  if (!ses || configuredSessions.has(ses)) return;
+  configuredSessions.add(ses);
+
+  // cinny://app → the bundled web build (SPA fallback to index.html).
+  ses.protocol.handle(SCHEME, async (request) => {
     const url = new URL(request.url);
     if (url.host !== HOST) return new Response('Not found', { status: 404 });
-    // SPA fallback: unknown routes → index.html (Cinny uses browser routing)
     const file = resolveFile(url.pathname) || path.join(WEB_ROOT, 'index.html');
     const res = await net.fetch(pathToFileURL(file).toString());
     const headers = new Headers(res.headers);
@@ -110,59 +134,78 @@ function registerAppProtocol() {
     if (path.basename(file) === 'sw.js') headers.set('Service-Worker-Allowed', '/');
     return new Response(res.body, { status: res.status, headers });
   });
+
+  // Only our own origin may use notifications/media/clipboard/fullscreen.
+  const allowed = new Set(['notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen']);
+  ses.setPermissionRequestHandler((wc, permission, cb) => {
+    cb(wc.getURL().startsWith(ORIGIN) && allowed.has(permission));
+  });
+
+  // Real "Save As" for downloads (the thing broken in Cinny Desktop). Target
+  // the window that initiated the download when we can find it.
+  ses.on('will-download', (_event, item, webContents) => {
+    const owner = BrowserWindow.fromWebContents(webContents) || frontWindow();
+    const target = dialog.showSaveDialogSync(owner || undefined, {
+      defaultPath: path.join(app.getPath('downloads'), item.getFilename()),
+    });
+    if (target) item.setSavePath(target);
+    else item.cancel();
+  });
 }
 
-let win;
+// --- Windows (one per profile) ---------------------------------------------
+const windows = new Map(); // slug -> BrowserWindow
+const wcToSlug = new Map(); // webContents.id -> slug
 
-// --- Dock icon -------------------------------------------------------------
-// Load the PNG for a colour. Returns null if missing (blue falls back to the
-// bundle icon, which is already blue — so no setIcon needed for default blue).
-function iconForColor(color) {
-  const file = path.join(PROFILE_ICON_DIR, `${P.sanitizeColor(color)}.png`);
-  try {
-    if (fs.existsSync(file)) {
-      const img = nativeImage.createFromPath(file);
-      if (!img.isEmpty()) return img;
-    }
-  } catch {}
+function slugForWebContents(wc) {
+  return wc ? (wcToSlug.get(wc.id) || null) : null;
+}
+// The profile window currently focused, or any open one as a fallback.
+function frontWindow() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && wcToSlug.has(focused.webContents.id)) return focused;
+  for (const w of windows.values()) if (w && !w.isDestroyed()) return w;
   return null;
-}
-
-// Apply the profile's colour to the Dock icon. Blue on the default profile is a
-// no-op (the bundle icon is already blue). Any other colour, or any named
-// profile, gets its coloured icon.
-function applyDockIcon() {
-  if (process.platform !== 'darwin' || !app.dock) return;
-  const color = (PROFILE && PROFILE.color) || P.DEFAULT_COLOR;
-  if (IS_DEFAULT && color === P.DEFAULT_COLOR) return; // bundle icon already blue
-  const img = iconForColor(color);
-  if (img) app.dock.setIcon(img);
 }
 
 // Coloured dot per profile colour, used in notification titles.
 const COLOR_DOT = { blue: '🔵', red: '🔴', green: '🟢', purple: '🟣', orange: '🟠', graphite: '⚫' };
 
-// Tag notifications only once there's more than one profile (a lone default
-// profile keeps plain notifications).
-function notificationTag() {
-  let multi = !IS_DEFAULT;
+// The profile's coloured iCinny PNG as a 128px data URL, for the notification
+// picture. Returns null if the icon is missing (notifications then show no
+// custom picture). build/profile-icons/*.png is kept for exactly this.
+function iconDataUrl(color) {
+  const file = path.join(PROFILE_ICON_DIR, `${P.sanitizeColor(color)}.png`);
   try {
-    multi = multi || P.readRegistry(APP_DATA).some((p) => p.slug !== PROFILE_SLUG);
+    if (fs.existsSync(file)) {
+      const img = nativeImage.createFromPath(file);
+      if (!img.isEmpty()) return img.resize({ width: 128, height: 128 }).toDataURL();
+    }
   } catch {}
-  if (!multi) return null;
-  const color = (PROFILE && PROFILE.color) || P.DEFAULT_COLOR;
-  const img = iconForColor(color);
+  return null;
+}
+
+// --- Per-window header bar + notification tag ------------------------------
+function applyProfileBar(win, slug) {
+  if (!win || win.isDestroyed()) return;
+  const color = (profileFor(slug) || {}).color || P.DEFAULT_COLOR;
+  win.webContents.executeJavaScript(profileBar.barScript(color, profileName(slug)), true).catch(() => {});
+}
+
+// Tag notifications (coloured dot + name prefix, coloured icon) once there is
+// more than one profile; a lone default profile keeps plain notifications.
+function notificationTag(slug) {
+  if (isDefaultSlug(slug) && !multiProfile()) return null;
+  const color = (profileFor(slug) || {}).color || P.DEFAULT_COLOR;
   return {
-    prefix: `${COLOR_DOT[color] || COLOR_DOT.blue} ${profileName()} · `,
-    icon: img ? img.resize({ width: 128, height: 128 }).toDataURL() : null,
+    prefix: `${COLOR_DOT[color] || COLOR_DOT.blue} ${profileName(slug)} · `,
+    icon: iconDataUrl(color),
   };
 }
 
-// Install (once) the window.Notification wrapper and (re)set its tag, so a
-// profile rename/recolour applies to the next notification straight away.
-function applyNotificationTag() {
+function applyNotificationTag(win, slug) {
   if (!win || win.isDestroyed()) return;
-  const tag = notificationTag();
+  const tag = notificationTag(slug);
   const js = `(() => {
     window.__icinnyNotifyTag = ${JSON.stringify(tag)};
     if (window.__icinnyNotifyWrapped) return;
@@ -185,20 +228,25 @@ function applyNotificationTag() {
   win.webContents.executeJavaScript(js, true).catch(() => {});
 }
 
-// Draw/update the header bar in the profile's colour with its name.
-function applyProfileBar() {
-  if (!win || win.isDestroyed()) return;
-  const color = (PROFILE && PROFILE.color) || P.DEFAULT_COLOR;
-  win.webContents.executeJavaScript(profileBar.barScript(color, profileName()), true).catch(() => {});
-}
+// Create (or focus) a profile's window in THIS process.
+function openProfileWindow(slug) {
+  const existing = windows.get(slug);
+  if (existing && !existing.isDestroyed()) {
+    existing.show();
+    existing.focus();
+    return existing;
+  }
 
-function createWindow() {
-  win = new BrowserWindow({
+  const partition = P.partitionFor(slug);
+  const ses = partition ? session.fromPartition(partition) : session.defaultSession;
+  setupSession(ses);
+
+  const win = new BrowserWindow({
     width: 1280,
     height: 860,
     minWidth: 480,
     minHeight: 500,
-    title: windowBaseTitle(),
+    title: windowBaseTitle(slug),
     show: !SELFTEST && process.env.CINNY_UPDATE_TEST !== '1',
     backgroundColor: '#1a1a1a',
     // The native title bar is replaced by a profile-coloured header bar drawn
@@ -212,26 +260,26 @@ function createWindow() {
       sandbox: true,
       spellcheck: true,
       backgroundThrottling: false,
+      session: ses,
     },
   });
 
+  windows.set(slug, win);
+  wcToSlug.set(win.webContents.id, slug);
+
   // Cinny sets document.title to "Cinny…"; show the app/profile name instead.
-  // Default: "<page> (Cinny→iCinny)". Named: prefix with "iCinny — <Name>".
   win.on('page-title-updated', (e, title) => {
     e.preventDefault();
-    const rewritten = String(title || APP_NAME).replace(/Cinny/g, APP_NAME);
-    win.setTitle(IS_DEFAULT ? rewritten : `${APP_NAME} — ${profileName()}`);
+    if (isDefaultSlug(slug) && !multiProfile()) {
+      win.setTitle(String(title || APP_NAME).replace(/Cinny/g, APP_NAME));
+    } else {
+      win.setTitle(`${APP_NAME} — ${profileName(slug)}`);
+    }
   });
 
-  // Notifications say which profile sent them: a coloured dot + the profile
-  // name in front of the title, and the profile's coloured iCinny icon as the
-  // notification picture. (macOS always draws the app's own blue icon on the
-  // left; that can't change per profile.) Wraps window.Notification in the
-  // page's main world; contextIsolation + sandbox stay ON.
-  win.webContents.on('dom-ready', applyNotificationTag);
-
-  // Profile-coloured header bar (all profiles, so every copy is tinted).
-  win.webContents.on('dom-ready', applyProfileBar);
+  // Per-window notification tag + header bar; re-applied on each load.
+  win.webContents.on('dom-ready', () => applyNotificationTag(win, slug));
+  win.webContents.on('dom-ready', () => applyProfileBar(win, slug));
 
   // External links → default browser, never a new Electron window.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -248,118 +296,77 @@ function createWindow() {
 
   win.loadURL(`${ORIGIN}/`);
 
-  // macOS: closing the window hides it (keeps syncing + notifications), like Element.
-  win.on('close', (e) => {
-    if (process.platform === 'darwin' && !app.isQuitting && !SELFTEST) {
-      e.preventDefault();
-      win.hide();
-    }
+  // Closing a profile window closes just that window (no app-wide hide): the
+  // process stays alive for the other profiles. The badge drops this window's
+  // contribution.
+  // Capture the id now: after 'closed' the window and its webContents are
+  // destroyed and reading win.webContents throws.
+  const wcId = win.webContents.id;
+  win.on('closed', () => {
+    badgeCounts.delete(wcId);
+    refreshBadge();
+    wcToSlug.delete(wcId);
+    if (windows.get(slug) === win) windows.delete(slug);
   });
+
+  return win;
 }
 
-function setupDownloads() {
-  // The thing that is broken in Cinny Desktop: real "Save As" for downloads.
-  session.defaultSession.on('will-download', (_event, item) => {
-    const target = dialog.showSaveDialogSync(win, {
-      defaultPath: path.join(app.getPath('downloads'), item.getFilename()),
-    });
-    if (target) item.setSavePath(target);
-    else item.cancel();
-  });
-}
+// --- Dock badge (sum across windows) ---------------------------------------
+const badgeCounts = new Map(); // webContents.id -> count (>0 number, -1 dot, 0 none)
+let lastBadge = null;
 
-function setupPermissions() {
-  const allowed = new Set(['notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen']);
-  session.defaultSession.setPermissionRequestHandler((wc, permission, cb) => {
-    cb(wc.getURL().startsWith(ORIGIN) && allowed.has(permission));
-  });
+function refreshBadge() {
+  let total = 0;
+  let anyDot = false;
+  for (const c of badgeCounts.values()) {
+    if (c > 0) total += c;
+    else if (c < 0) anyDot = true;
+  }
+  const text = total > 0 ? (total > 99 ? '99+' : String(total)) : anyDot ? '•' : '';
+  if (text === lastBadge) return;
+  lastBadge = text;
+  if (process.platform === 'darwin') {
+    if (app.dock) app.dock.setBadge(text);
+  } else {
+    app.setBadgeCount(total > 0 ? total : 0);
+  }
 }
 
 function setupBadge() {
-  // count > 0 → number; -1 → dot (favicon fallback); 0 → clear.
-  // Each instance has its own process, so each gets its own Dock badge already.
-  let last = null;
-  ipcMain.on('badge', (_e, { count }) => {
-    const text = count > 0 ? (count > 99 ? '99+' : String(count)) : count < 0 ? '•' : '';
-    if (text === last) return;
-    last = text;
-    if (process.platform === 'darwin') app.dock.setBadge(text);
-    else app.setBadgeCount(Math.max(count, 0));
+  ipcMain.on('badge', (e, { count }) => {
+    if (!wcToSlug.has(e.sender.id)) return; // only our profile windows
+    badgeCounts.set(e.sender.id, Number(count) || 0);
+    refreshBadge();
   });
 }
 
-// --- OAuth (next-gen auth / MAS) --------------------------------------------
-// Register the main-process OAuth handlers. The only accepted IPC sender is the
-// main app window's webContents (checked inside the module). The refresh token
-// is stored encrypted in this profile's userData (already per-profile, set
-// before the single-instance lock). Every profile process runs this with its
-// own userData, so each account keeps its own refresh token.
+// --- OAuth (next-gen auth / MAS) -------------------------------------------
+// One flow + token store per profile (inside oauth.js), resolved from the
+// sender window. Named profiles store under <userData>/oauth/<slug>/; the
+// default profile keeps the legacy location.
+let oauthCtl = null;
 function setupOAuth() {
-  oauth.registerOAuthIpc({
-    getMainWindow: () => win,
-    userDataDir: app.getPath('userData'),
+  oauthCtl = oauth.registerOAuthIpc({
+    getProfileWindows: () => windows,
+    slugForSender: slugForWebContents,
+    baseUserDataDir: BASE_USER_DATA,
   });
-}
-
-// --- Launch / focus another profile ---------------------------------------
-// Launch a profile as a separate running copy using `open -n -a <this .app>`.
-// Uses the running bundle path and passes args as an array (no shell), so a
-// profile slug can never be interpreted as a shell token.
-function appBundlePath() {
-  // .../iCinny.app/Contents/MacOS/iCinny → .../iCinny.app
-  const p = path.resolve(path.dirname(process.execPath), '..', '..');
-  return p.endsWith('.app') ? p : null;
-}
-
-function launchProfile(slug) {
-  if (slug === PROFILE_SLUG) {
-    // Same profile → focus our own window (the lock makes a second launch a no-op).
-    if (win) { win.show(); win.focus(); }
-    return;
-  }
-  const bundle = appBundlePath();
-  if (!bundle) {
-    // Not packaged (dev run): can't re-open the bundle; inform.
-    dialog.showMessageBox({ type: 'info', message: 'Switching profiles needs the installed app.', detail: 'Run the packaged iCinny.app to open other profiles.' });
-    return;
-  }
-  const args = ['-n', '-a', bundle, '--args'];
-  if (slug !== P.DEFAULT_SLUG) args.push(`--profile=${slug}`);
-  try {
-    const child = spawn('/usr/bin/open', args, { detached: true, stdio: 'ignore' });
-    child.unref();
-  } catch (e) {
-    dialog.showMessageBox({ type: 'warning', message: 'Could not open that profile', detail: String(e && e.message || e) });
-  }
-}
-
-// --- Auto-open profiles ----------------------------------------------------
-// When the DEFAULT profile starts, launch every profile marked openAtLaunch
-// that is not already running. Named profiles never auto-open others.
-function autoOpenProfiles() {
-  if (!IS_DEFAULT) return;
-  const bundle = appBundlePath();
-  if (!bundle) return; // dev run
-  const reg = P.readRegistry(APP_DATA);
-  for (const p of reg) {
-    if (p.slug === P.DEFAULT_SLUG) continue;
-    if (!p.openAtLaunch) continue;
-    launchProfile(p.slug);
-  }
 }
 
 // --- Profile editor window (New / Edit) ------------------------------------
 let editorWin = null;
 function openProfileEditor(mode, slug) {
   if (editorWin && !editorWin.isDestroyed()) { editorWin.focus(); return; }
+  const parent = frontWindow();
   editorWin = new BrowserWindow({
     width: 420,
     height: 460,
     resizable: false,
     minimizable: false,
     maximizable: false,
-    parent: win || undefined,
-    modal: !!win,
+    parent: parent || undefined,
+    modal: !!parent,
     title: mode === 'new' ? 'New Profile' : 'Edit Profile',
     backgroundColor: '#1f1f22',
     webPreferences: {
@@ -373,17 +380,19 @@ function openProfileEditor(mode, slug) {
   editorWin.loadFile(path.join(__dirname, 'ui', 'profile-editor.html'));
   editorWin.on('closed', () => { editorWin = null; });
 
-  // Hand the editor its initial data once it's ready.
+  editorWin.editTargetSlug = mode === 'edit' ? (slug || P.DEFAULT_SLUG) : null;
+
   editorWin.webContents.on('did-finish-load', () => {
-    const existing = mode === 'edit' ? PROFILE : null;
+    const target = editorWin.editTargetSlug;
+    const existing = mode === 'edit' ? profileFor(target) : null;
     editorWin.webContents.send('editor:init', {
       mode,
       colors: P.COLORS,
-      slug: slug || '',
+      slug: target || '',
       name: existing ? existing.name : '',
       color: existing ? existing.color : P.DEFAULT_COLOR,
       openAtLaunch: existing ? !!existing.openAtLaunch : false,
-      isDefault: mode === 'edit' ? IS_DEFAULT : false,
+      isDefault: mode === 'edit' ? isDefaultSlug(target) : false,
     });
   });
 }
@@ -391,37 +400,36 @@ function openProfileEditor(mode, slug) {
 // IPC from the editor window (validated here; the editor has no privileges).
 function setupProfileIpc() {
   ipcMain.handle('profile:save', (_e, payload) => {
-    // Only the profile editor window may change profiles.
-    if (!editorWin || editorWin.isDestroyed() || _e.sender !== editorWin.webContents) return { ok: false, error: 'Not allowed.' };
+    if (!editorWin || editorWin.isDestroyed() || _e.sender !== editorWin.webContents) {
+      return { ok: false, error: 'Not allowed.' };
+    }
     const data = payload && typeof payload === 'object' ? payload : {};
     const name = P.sanitizeName(data.name, '');
     const color = P.sanitizeColor(data.color);
     const openAtLaunch = data.openAtLaunch === true;
-    const reg = P.readRegistry(APP_DATA);
+    const reg = readRegistry();
 
     if (data.mode === 'edit') {
-      // Edit the CURRENT profile (named or default).
-      const idx = reg.findIndex((p) => p.slug === PROFILE_SLUG);
+      const target = editorWin.editTargetSlug || P.DEFAULT_SLUG;
+      const def = isDefaultSlug(target);
+      const idx = reg.findIndex((p) => p.slug === target);
       const entry = {
-        slug: PROFILE_SLUG,
-        name: name || (IS_DEFAULT ? P.DEFAULT_NAME : PROFILE_SLUG),
+        slug: target,
+        name: name || (def ? P.DEFAULT_NAME : target),
         color,
-        openAtLaunch: IS_DEFAULT ? false : openAtLaunch,
+        openAtLaunch: def ? false : openAtLaunch,
       };
       if (idx >= 0) reg[idx] = entry; else reg.push(entry);
       P.writeRegistry(APP_DATA, reg);
-      PROFILE = entry;
-      // Apply live: dock icon + window title.
-      applyDockIcon();
-      applyProfileBar();
-      applyNotificationTag();
-      if (win) win.setTitle(windowBaseTitle());
-      app.setAboutPanelOptions({
-        applicationName: APP_NAME,
-        applicationVersion: `${updater.BUILD.version} (build ${updater.BUILD.build})`,
-        credits: aboutCredits(),
-      });
+      // Apply live to that profile's window (if open).
+      const win = windows.get(target);
+      if (win && !win.isDestroyed()) {
+        applyProfileBar(win, target);
+        applyNotificationTag(win, target);
+        win.setTitle(windowBaseTitle(target));
+      }
       rebuildMenu();
+      updateAboutPanel();
       return { ok: true };
     }
 
@@ -432,7 +440,14 @@ function setupProfileIpc() {
     reg.push({ slug, name, color, openAtLaunch });
     P.writeRegistry(APP_DATA, reg);
     rebuildMenu();
-    launchProfile(slug);
+    // Once a second profile exists, the default window's title/notifications
+    // gain their tag — refresh the default window if it is open.
+    const defWin = windows.get(P.DEFAULT_SLUG);
+    if (defWin && !defWin.isDestroyed()) {
+      defWin.setTitle(windowBaseTitle(P.DEFAULT_SLUG));
+      applyNotificationTag(defWin, P.DEFAULT_SLUG);
+    }
+    openProfileWindow(slug);
     return { ok: true, slug };
   });
 
@@ -444,21 +459,11 @@ function setupProfileIpc() {
 
 // --- Delete profile --------------------------------------------------------
 function deleteProfileFlow(slug) {
-  const reg = P.readRegistry(APP_DATA);
+  const reg = readRegistry();
   const p = P.findProfile(reg, slug);
   if (!p || slug === P.DEFAULT_SLUG) return;
 
-  // Refuse while that profile is running (its single-instance lock dir is busy).
-  if (isProfileRunning(slug)) {
-    dialog.showMessageBox(win || undefined, {
-      type: 'info',
-      message: `“${p.name}” is still open.`,
-      detail: 'Quit that profile’s window first, then delete it.',
-    });
-    return;
-  }
-
-  const choice = dialog.showMessageBoxSync(win || undefined, {
+  const choice = dialog.showMessageBoxSync(frontWindow() || undefined, {
     type: 'warning',
     buttons: ['Delete', 'Cancel'],
     defaultId: 1,
@@ -468,55 +473,70 @@ function deleteProfileFlow(slug) {
   });
   if (choice !== 0) return;
 
-  // Remove the data folder, then the registry entry.
-  const dir = P.userDataDir({ slug, appData: APP_DATA, defaultUserData: DEFAULT_USER_DATA, legacyExists: false });
-  try {
-    if (dir && dir.startsWith(P.profilesDir(APP_DATA) + path.sep)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  } catch (e) {
-    dialog.showMessageBox(win || undefined, { type: 'warning', message: 'Could not fully remove the data folder', detail: String(e && e.message || e) });
-  }
-  const next = reg.filter((x) => x.slug !== slug);
-  P.writeRegistry(APP_DATA, next);
-  rebuildMenu();
-}
+  // Close its window.
+  const win = windows.get(slug);
+  if (win && !win.isDestroyed()) win.close();
+  windows.delete(slug);
 
-// Is a profile currently running? Check its single-instance lock dir / userData.
-// A running Electron app holds the SingletonLock symlink in its userData dir.
-function isProfileRunning(slug) {
-  if (slug === PROFILE_SLUG) return true; // us
-  const dir = P.userDataDir({ slug, appData: APP_DATA, defaultUserData: DEFAULT_USER_DATA, legacyExists: slug === P.DEFAULT_SLUG && fs.existsSync(LEGACY_DIR) });
-  try {
-    return fs.existsSync(path.join(dir, 'SingletonLock'));
-  } catch {
-    return false;
+  // Clear its partition storage, then its on-disk oauth dir.
+  const partition = P.partitionFor(slug);
+  const finish = () => {
+    // Remove the profile's oauth dir and drop its in-memory OAuth flow.
+    try {
+      const dir = oauth.oauthDirFor(slug, BASE_USER_DATA);
+      if (dir && dir !== BASE_USER_DATA && dir.startsWith(path.join(BASE_USER_DATA, 'oauth') + path.sep)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {}
+    if (oauthCtl && oauthCtl.clearProfile) oauthCtl.clearProfile(slug);
+    const next = reg.filter((x) => x.slug !== slug);
+    P.writeRegistry(APP_DATA, next);
+    rebuildMenu();
+  };
+  if (partition) {
+    const ses = session.fromPartition(partition);
+    Promise.resolve(ses.clearStorageData()).catch(() => {}).then(finish);
+  } else {
+    finish();
   }
 }
 
 // --- Menu ------------------------------------------------------------------
 function aboutCredits() {
-  const who = IS_DEFAULT && profileName() === APP_NAME ? '' : `Profile: ${profileName()}\n`;
-  return `${who}iCinny: the Cinny web client (cinny.in) in an Electron shell`;
+  return 'iCinny: the Cinny web client (cinny.in) in an Electron shell';
+}
+function updateAboutPanel() {
+  app.setAboutPanelOptions({
+    applicationName: APP_NAME,
+    applicationVersion: `${updater.BUILD.version} (build ${updater.BUILD.build})`,
+    credits: aboutCredits(),
+  });
 }
 
 function profilesMenu() {
-  const reg = P.readRegistry(APP_DATA);
+  const reg = readRegistry();
   const items = [];
   for (const p of reg) {
     const label = p.slug === P.DEFAULT_SLUG ? (p.name || APP_NAME) : p.name;
+    const isOpen = windows.has(p.slug) && !windows.get(p.slug).isDestroyed();
     items.push({
       label,
       type: 'checkbox',
-      checked: p.slug === PROFILE_SLUG,
-      click: () => launchProfile(p.slug),
+      checked: isOpen,
+      click: () => openProfileWindow(p.slug),
     });
   }
   items.push({ type: 'separator' });
   items.push({ label: 'New Profile…', click: () => openProfileEditor('new') });
-  items.push({ label: 'Edit This Profile…', click: () => openProfileEditor('edit', PROFILE_SLUG) });
+  items.push({
+    label: 'Edit This Profile…',
+    click: () => {
+      const w = frontWindow();
+      const slug = w ? slugForWebContents(w.webContents) : P.DEFAULT_SLUG;
+      openProfileEditor('edit', slug || P.DEFAULT_SLUG);
+    },
+  });
 
-  // Delete submenu — named profiles only.
   const deletable = reg.filter((p) => p.slug !== P.DEFAULT_SLUG);
   if (deletable.length) {
     items.push({
@@ -527,28 +547,13 @@ function profilesMenu() {
   return { label: 'Profiles', submenu: items };
 }
 
-function updatesMenuItem() {
-  if (IS_DEFAULT) {
-    return { label: 'Check for Updates…', click: () => updater.check({ manual: true }) };
-  }
-  // Named profiles don't run the updater. Explain in plain language.
-  return {
-    label: 'Check for Updates…',
-    click: () => dialog.showMessageBox(win || undefined, {
-      type: 'info',
-      message: 'Updates are handled by your main iCinny.',
-      detail: 'Open the main iCinny window and choose “Check for Updates…” there. All profiles update together.',
-    }),
-  };
-}
-
 function buildMenuTemplate() {
   return [
     {
       label: app.name,
       submenu: [
         { role: 'about' },
-        updatesMenuItem(),
+        { label: 'Check for Updates…', click: () => updater.check({ manual: true }) },
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -575,6 +580,8 @@ function buildMenuTemplate() {
       ],
     },
     profilesMenu(),
+    // The standard Window menu lists every open window by title ("iCinny —
+    // <Name>") and gives Cmd+` to cycle them.
     { role: 'windowMenu' },
   ];
 }
@@ -583,13 +590,33 @@ function rebuildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildMenuTemplate()));
 }
 
-function setupMenu() {
-  rebuildMenu();
+// --- Which profile windows to open on launch -------------------------------
+// Open the default profile, every profile marked openAtLaunch, AND (for an
+// update relaunch) whatever windows were open when we quit — the union, so a
+// relaunch restores the previous windows in addition to the open-automatically
+// ones. The persisted list is cleared implicitly: it is overwritten on the
+// next quit with whatever is actually open then.
+function slugsToOpenAtLaunch() {
+  const reg = readRegistry();
+  const valid = new Set(reg.map((p) => p.slug));
+  const persisted = P.readOpenSlugs(APP_DATA).filter((s) => valid.has(s));
+  const autoOpen = reg.filter((p) => p.slug !== P.DEFAULT_SLUG && p.openAtLaunch).map((p) => p.slug);
+  // Union, default first, de-duplicated, order stable.
+  const set = new Set([P.DEFAULT_SLUG, ...persisted, ...autoOpen]);
+  return Array.from(set);
+}
+
+// Persist the set of currently-open profile windows (for an update relaunch).
+function persistOpenWindows() {
+  const open = [];
+  for (const [slug, w] of windows.entries()) if (w && !w.isDestroyed()) open.push(slug);
+  P.writeOpenSlugs(APP_DATA, open);
 }
 
 async function selfTest() {
   // Headless check: app loads, secure context, SW registers & controls the page.
-  const out = { profile: PROFILE_SLUG };
+  const win = windows.get(P.DEFAULT_SLUG);
+  const out = { profile: P.DEFAULT_SLUG };
   try {
     await new Promise((r) => win.webContents.once('did-finish-load', r));
     await new Promise((r) => setTimeout(r, 4000));
@@ -612,14 +639,12 @@ async function selfTest() {
       };
     })()`;
     Object.assign(out, await win.webContents.executeJavaScript(js, true));
-    // If SW didn't claim on first load, a reload is normal — check again.
     if (!out.swControlling) {
       win.webContents.reload();
       await new Promise((r) => win.webContents.once('did-finish-load', r));
       await new Promise((r) => setTimeout(r, 2500));
       out.swControllingAfterReload = await win.webContents.executeJavaScript('!!navigator.serviceWorker.controller', true);
     }
-    // Cross-origin reachability of the homeserver from the app origin (CORS path Cinny uses).
     out.homeserver = await win.webContents.executeJavaScript(
       `fetch('https://matrix-client.matrix.org/_matrix/client/versions').then(r => r.status).catch(e => 'ERR ' + e.message)`, true);
     out.config = await win.webContents.executeJavaScript(
@@ -632,45 +657,46 @@ async function selfTest() {
 }
 
 app.whenReady().then(() => {
-  registerAppProtocol();
-  setupPermissions();
-  setupDownloads();
+  // Configure the default session before the first window loads.
+  setupSession(session.defaultSession);
   setupBadge();
   setupProfileIpc();
   setupOAuth();
-  setupMenu();
-  applyDockIcon();
-  app.setAboutPanelOptions({
-    applicationName: APP_NAME,
-    applicationVersion: `${updater.BUILD.version} (build ${updater.BUILD.build})`,
-    credits: aboutCredits(),
-  });
-  createWindow();
+  rebuildMenu();
+  updateAboutPanel();
+
   if (SELFTEST) {
+    openProfileWindow(P.DEFAULT_SLUG);
     selfTest();
-  } else {
-    // Only the DEFAULT profile runs the updater and auto-opens other profiles.
-    if (IS_DEFAULT) {
-      updater.start(() => win, { appData: APP_DATA });
-      autoOpenProfiles();
-    } else {
-      // Named profile: watch for a quit-request from the default instance
-      // (used during an update swap) and quit when asked.
-      updater.watchQuitRequest(APP_DATA, () => { app.isQuitting = true; app.quit(); });
-    }
+    return;
   }
+
+  for (const slug of slugsToOpenAtLaunch()) openProfileWindow(slug);
+  // Single updater for the one process.
+  updater.start(() => frontWindow(), { appData: APP_DATA });
 });
 
 app.on('second-instance', () => {
-  if (win) { win.show(); win.focus(); }
+  const w = frontWindow();
+  if (w) { w.show(); w.focus(); }
 });
+
 app.on('activate', () => {
-  if (win) win.show(); else createWindow();
+  const w = frontWindow();
+  if (w) { w.show(); w.focus(); }
+  else openProfileWindow(P.DEFAULT_SLUG);
 });
+
 app.on('before-quit', () => {
   app.isQuitting = true;
-  if (IS_DEFAULT) updater.installOnQuit({ appData: APP_DATA });
+  // Remember which profile windows were open so an update relaunch restores them.
+  persistOpenWindows();
+  updater.installOnQuit({ appData: APP_DATA });
 });
+
 app.on('window-all-closed', () => {
+  // macOS convention: the app stays alive in the Dock when all windows close;
+  // clicking the Dock icon (activate) reopens the default profile window.
+  // Other platforms quit.
   if (process.platform !== 'darwin') app.quit();
 });

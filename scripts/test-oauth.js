@@ -629,3 +629,44 @@ test('concurrent refreshes share one request (an old refresh token is never reus
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Per-profile isolation (one-app model: one flow + token store per profile)
+// ---------------------------------------------------------------------------
+
+test('oauthDirFor: default profile → base dir; named profile → oauth/<slug>', () => {
+  const base = '/UD';
+  assert.strictEqual(o.oauthDirFor('default', base), base);
+  assert.strictEqual(o.oauthDirFor('', base), base);
+  assert.strictEqual(o.oauthDirFor(null, base), base);
+  assert.strictEqual(o.oauthDirFor('work', base), path.join(base, 'oauth', 'work'));
+  assert.strictEqual(o.oauthDirFor('home', base), path.join(base, 'oauth', 'home'));
+});
+
+test('two profiles have separate token stores (no cross-profile leakage)', () => {
+  const base = tmpDir();
+  const safeStub = {
+    isEncryptionAvailable: () => false,
+    encryptString: (s) => Buffer.from(s),
+    decryptString: (b) => b.toString(),
+  };
+  try {
+    const dirA = o.oauthDirFor('work', base);
+    const dirB = o.oauthDirFor('home', base);
+    assert.notStrictEqual(dirA, dirB);
+    const tokensA = o.tokenStore({ userDataDir: dirA, safeStorage: safeStub });
+    const tokensB = o.tokenStore({ userDataDir: dirB, safeStorage: safeStub });
+    tokensA.save({ userId: '@a:x', refreshToken: 'ra', accessToken: 'aa' });
+    // B must not see A's session, and vice-versa after B saves its own.
+    assert.strictEqual(tokensB.load(), null);
+    tokensB.save({ userId: '@b:x', refreshToken: 'rb', accessToken: 'ab' });
+    assert.strictEqual(tokensA.load().userId, '@a:x');
+    assert.strictEqual(tokensA.load().refreshToken, 'ra');
+    assert.strictEqual(tokensB.load().userId, '@b:x');
+    assert.strictEqual(tokensB.load().refreshToken, 'rb');
+    // The default profile keeps using the base dir (legacy location).
+    assert.strictEqual(o.oauthDirFor('default', base), base);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

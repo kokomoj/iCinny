@@ -175,6 +175,7 @@ function findProfile(registry, slug) {
 
 // Parse --profile=<slug> out of an argv array. Returns a sanitised slug, or
 // DEFAULT_SLUG when the flag is absent/empty/invalid.
+// (Retained for compatibility; the one-app model no longer launches by --profile.)
 function parseProfileArg(argv) {
   for (const a of argv || []) {
     const m = /^--profile=(.*)$/.exec(String(a));
@@ -184,6 +185,66 @@ function parseProfileArg(argv) {
     }
   }
   return DEFAULT_SLUG;
+}
+
+// ---- one-app model: sessions + open-window persistence -------------------
+
+// The Electron session partition for a profile. The default profile uses the
+// default session (null → session.defaultSession in main.js); every named
+// profile gets its own persisted partition so its web storage (localStorage,
+// IndexedDB, cookies, service worker) is isolated.
+function partitionFor(slug) {
+  if (!slug || slug === DEFAULT_SLUG) return null;
+  return `persist:profile-${slug}`;
+}
+
+// Where the "which profile windows were open at quit" list lives, so a restart
+// (e.g. after an update swap) can reopen the same windows.
+function openSlugsPath(appData) {
+  return path.join(profilesDir(appData), 'open-windows.json');
+}
+
+// Coerce an arbitrary slug list into clean, de-duplicated, order-preserving
+// slugs. 'default' is allowed; named slugs must be valid; everything else drops.
+function sanitizeSlugList(list) {
+  const out = [];
+  const seen = new Set();
+  if (Array.isArray(list)) {
+    for (const raw of list) {
+      const slug = raw === DEFAULT_SLUG ? DEFAULT_SLUG : (isValidSlug(raw) ? raw : null);
+      if (!slug || seen.has(slug)) continue;
+      seen.add(slug);
+      out.push(slug);
+    }
+  }
+  return out;
+}
+
+// Read the open-window slug list. ANY problem returns [] — never throws.
+function readOpenSlugs(appData) {
+  try {
+    const txt = fs.readFileSync(openSlugsPath(appData), 'utf8');
+    return sanitizeSlugList(JSON.parse(txt));
+  } catch {
+    return [];
+  }
+}
+
+// Write the open-window slug list atomically, after sanitising. Returns the
+// cleaned list. Best-effort: swallows fs errors (it must never block quit).
+function writeOpenSlugs(appData, slugs) {
+  const clean = sanitizeSlugList(slugs);
+  try {
+    const dir = profilesDir(appData);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = openSlugsPath(appData);
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(clean) + '\n');
+    fs.renameSync(tmp, file);
+  } catch {
+    /* best-effort; ignore */
+  }
+  return clean;
 }
 
 module.exports = {
@@ -209,4 +270,8 @@ module.exports = {
   writeRegistry,
   findProfile,
   parseProfileArg,
+  partitionFor,
+  openSlugsPath,
+  readOpenSlugs,
+  writeOpenSlugs,
 };

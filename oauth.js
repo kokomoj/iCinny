@@ -617,46 +617,94 @@ function createOAuthFlow(deps) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-profile OAuth storage directory.
+//   default profile → the base userData dir (legacy location, unchanged)
+//   named profile   → <userData>/oauth/<slug>/
+// Pure (no electron) so it is unit-testable.
+// ---------------------------------------------------------------------------
+function oauthDirFor(slug, baseUserDataDir) {
+  if (!slug || slug === 'default') return baseUserDataDir;
+  return path.join(baseUserDataDir, 'oauth', slug);
+}
+
+// ---------------------------------------------------------------------------
 // Electron wiring. Lazily requires electron so this file is require-able (and
 // unit-testable) in a plain node:test process.
 //
-// getMainWindow() -> the BrowserWindow whose webContents is the ONLY accepted
-// IPC sender. userDataDir -> the active profile's userData folder.
+// getProfileWindows() -> an iterable (Map or array) of the app's profile
+//   BrowserWindows; a sender is accepted iff it is one of their webContents.
+// slugForSender(webContents) -> the profile slug that owns a webContents, or
+//   null if it is not one of ours.
+// baseUserDataDir -> the app's base userData folder (default profile's store;
+//   named profiles nest under <base>/oauth/<slug>/).
+//
+// One OAuth flow (loopback server, PKCE verifier, pending promise, token &
+// client stores) is created lazily PER PROFILE and cached, so two profiles
+// signing in at once never share state.
 // ---------------------------------------------------------------------------
-function registerOAuthIpc({ getMainWindow, userDataDir }) {
+function registerOAuthIpc({ getProfileWindows, slugForSender, baseUserDataDir }) {
   // eslint-disable-next-line global-require
   const { ipcMain, shell, safeStorage, app } = require('electron');
-  const dir = userDataDir || (app && app.getPath('userData'));
+  const base = baseUserDataDir || (app && app.getPath('userData'));
 
-  const tokens = tokenStore({ userDataDir: dir, safeStorage });
-  const clients = clientIdStore({ userDataDir: dir });
+  // slug -> flow. Each profile gets its own stores + single-flight flow.
+  const flows = new Map();
 
-  const sendStatus = (status) => {
-    const win = getMainWindow();
-    if (win && !win.isDestroyed()) win.webContents.send('oauth:status', status);
-  };
+  function flowForSlug(slug) {
+    let entry = flows.get(slug);
+    if (entry) return entry;
+    const dir = oauthDirFor(slug, base);
+    const tokens = tokenStore({ userDataDir: dir, safeStorage });
+    const clients = clientIdStore({ userDataDir: dir });
+    const sendStatus = (status) => {
+      const win = windowForSlug(slug);
+      if (win && !win.isDestroyed()) win.webContents.send('oauth:status', status);
+    };
+    const flow = createOAuthFlow({
+      fetchFn: (...a) => fetch(...a), // Node/Electron global fetch
+      tokens,
+      clients,
+      openExternal: (url) => shell.openExternal(url),
+      onStatus: sendStatus,
+    });
+    entry = { flow, tokens, clients };
+    flows.set(slug, entry);
+    return entry;
+  }
 
-  const flow = createOAuthFlow({
-    fetchFn: (...a) => fetch(...a), // Node/Electron global fetch
-    tokens,
-    clients,
-    openExternal: (url) => shell.openExternal(url),
-    onStatus: sendStatus,
-  });
+  // Iterate the app's profile windows (Map values or array).
+  function profileWindows() {
+    const w = getProfileWindows ? getProfileWindows() : [];
+    if (!w) return [];
+    if (typeof w.values === 'function' && !Array.isArray(w)) return Array.from(w.values());
+    return Array.from(w);
+  }
 
-  // Only accept IPC from the main app window's webContents.
-  const fromMainWindow = (e) => {
-    const win = getMainWindow();
-    return !!win && !win.isDestroyed() && e.sender === win.webContents;
+  function windowForSlug(slug) {
+    for (const win of profileWindows()) {
+      if (win && !win.isDestroyed() && slugForSender && slugForSender(win.webContents) === slug) return win;
+    }
+    return null;
+  }
+
+  // Resolve the sender to one of our profile windows; returns its slug or null.
+  const senderSlug = (e) => {
+    for (const win of profileWindows()) {
+      if (win && !win.isDestroyed() && e.sender === win.webContents) {
+        return slugForSender ? slugForSender(win.webContents) : null;
+      }
+    }
+    return null;
   };
 
   ipcMain.handle('oauth:start', async (e, baseUrl) => {
-    if (!fromMainWindow(e)) return { ok: false, error: 'not allowed' };
+    const slug = senderSlug(e);
+    if (slug === null) return { ok: false, error: 'not allowed' };
     if (typeof baseUrl !== 'string' || baseUrl.length > MAX_URL_LEN) {
       return { ok: false, error: 'invalid server' };
     }
     try {
-      const result = await flow.start(baseUrl);
+      const result = await flowForSlug(slug).flow.start(baseUrl);
       return { ok: true, result };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
@@ -664,14 +712,16 @@ function registerOAuthIpc({ getMainWindow, userDataDir }) {
   });
 
   ipcMain.handle('oauth:cancel', (e) => {
-    if (!fromMainWindow(e)) return { ok: false, error: 'not allowed' };
-    return { ok: true, cancelled: flow.cancel() };
+    const slug = senderSlug(e);
+    if (slug === null) return { ok: false, error: 'not allowed' };
+    return { ok: true, cancelled: flowForSlug(slug).flow.cancel() };
   });
 
   ipcMain.handle('oauth:refresh', async (e) => {
-    if (!fromMainWindow(e)) return { ok: false, error: 'not allowed' };
+    const slug = senderSlug(e);
+    if (slug === null) return { ok: false, error: 'not allowed' };
     try {
-      const result = await flow.refresh();
+      const result = await flowForSlug(slug).flow.refresh();
       return { ok: true, result };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
@@ -679,10 +729,11 @@ function registerOAuthIpc({ getMainWindow, userDataDir }) {
   });
 
   ipcMain.handle('oauth:logout', async (e, accessToken) => {
-    if (!fromMainWindow(e)) return { ok: false, error: 'not allowed' };
+    const slug = senderSlug(e);
+    if (slug === null) return { ok: false, error: 'not allowed' };
     const at = typeof accessToken === 'string' ? accessToken : undefined;
     try {
-      await flow.logout(at);
+      await flowForSlug(slug).flow.logout(at);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
@@ -692,8 +743,9 @@ function registerOAuthIpc({ getMainWindow, userDataDir }) {
   // Expose the stored account-management URI (for the OIDC dashboard link) and
   // whether a stored token looks expired (for the startup refresh).
   ipcMain.handle('oauth:info', (e) => {
-    if (!fromMainWindow(e)) return { ok: false, error: 'not allowed' };
-    const s = tokens.load();
+    const slug = senderSlug(e);
+    if (slug === null) return { ok: false, error: 'not allowed' };
+    const s = flowForSlug(slug).tokens.load();
     if (!s) return { ok: true, result: null };
     return {
       ok: true,
@@ -705,6 +757,17 @@ function registerOAuthIpc({ getMainWindow, userDataDir }) {
       },
     };
   });
+
+  // Let the app drop a profile's OAuth state when the profile is deleted.
+  return {
+    clearProfile(slug) {
+      const entry = flows.get(slug);
+      if (entry) {
+        try { entry.tokens.clear(); } catch { /* ignore */ }
+        flows.delete(slug);
+      }
+    },
+  };
 }
 
 module.exports = {
@@ -727,6 +790,8 @@ module.exports = {
   tokenStore,
   clientIdStore,
   createOAuthFlow,
+  // per-profile storage
+  oauthDirFor,
   // electron wiring
   registerOAuthIpc,
   // constants (handy in tests)

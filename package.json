@@ -1,7 +1,7 @@
 {
   "name": "cinny-electron",
   "productName": "iCinny",
-  "version": "4.12.7",
+  "version": "4.12.8",
   "description": "iCinny: the Cinny Matrix client in an Electron/Chromium shell for macOS",
   "main": "main.js",
   "private": true,
